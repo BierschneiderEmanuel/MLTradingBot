@@ -10,8 +10,8 @@ from finbert_utils import estimate_sentiment
 from collections import namedtuple
 import pandas as pd
 import numpy as np
-API_KEY = "YOUR API KEY" 
-API_SECRET = "YOUR API SECRET" 
+API_KEY = "YOUR API KEY"
+API_SECRET = "YOUR API SECRET"
 BASE_URL = "https://paper-api.alpaca.markets"
 
 ALPACA_CREDS = {
@@ -21,24 +21,29 @@ ALPACA_CREDS = {
 }
 
 class MLTrader(Strategy): 
-    symb = "NVDA"# "BTC-USD" #"NVDA" #"MSFT" #"AMZN" #"NFLX" #"TSLA" #"AMD" #"HUBS" # "AMZ" #"SHOP"
+    symb = "AMZN" #"SPY" #"BTC-USD" #"NVDA" #"MSFT" #"AMZN" #"NFLX" #"TSLA" #"AMD" #"HUBS" # "AMZ" #"SHOP"
     x = 1 #number of days before
     data_price = []
+    cash_position = 0
+    last_price_position = 0
+    quantity_position = 0
     TRADE_INDICATOR_NEWS_ONLY = 1
     TRADE_INDICATOR_MOVING_AVG_ONLY = 2
     TRADE_INDICATOR_MOVING_AVG_AND_NEWS = 3
     USE_TRADE_INDICATOR = TRADE_INDICATOR_MOVING_AVG_AND_NEWS
+    FLAT_DOLLAR_FEE = 10
     # Create two trading fees, one that is a percentage and one that is a flat fee
-    trading_fee_1 = TradingFee(flat_fee=10) # $10 flat fee
+    trading_fee_1 = TradingFee(flat_fee=FLAT_DOLLAR_FEE) # $10 flat fee
     #trading_fee_2 = TradingFee(percent_fee=0.01) # 1% trading fee
     ai_propability = .999 #.999
+    CASH_AT_RISK_FACTOR = float(.7)
     trading_iterator_count = 0
     GT_NONE = 0
     GT_BUY = 1
     GT_SEL = 2
     ma_indication_value = GT_NONE
     PointF = namedtuple('PointF', ['X', 'Y'], defaults=[0, 0])
-    def initialize(self, symbol:str=symb, cash_at_risk:float=.5): 
+    def initialize(self, symbol:str=symb, cash_at_risk:float=CASH_AT_RISK_FACTOR): 
         self.symbol = symbol
         self.sleeptime = "24H" 
         self.last_trade = None 
@@ -46,11 +51,14 @@ class MLTrader(Strategy):
         self.api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)
 
     def position_sizing(self):
+        if not self.portfolio_value>=0: raise Exception("Exception: Portfolio value is negative")
         cash = self.get_cash() 
+        if(cash<0):
+            print ("cash is negative")
         if not cash>=0: raise Exception("Exception: Cash is negative")
         last_price = self.get_last_price(self.symbol)
         self.data_price.append(last_price)
-        quantity = round(cash * self.cash_at_risk / last_price,0)
+        quantity = round((cash - self.FLAT_DOLLAR_FEE) * self.cash_at_risk / last_price,0)
         return cash, last_price, quantity
 
     def get_dates(self): 
@@ -68,10 +76,10 @@ class MLTrader(Strategy):
     def on_trading_iteration(self):
         self.trading_iterator_count += 1
         try:
-            cash, last_price, quantity = self.position_sizing()
-            print(" cash: ", cash)
-        except:
-            print("Exception: position_sizing error") 
+            self.cash_position, self.last_price_position, self.quantity_position = self.position_sizing()
+            print(" cash: ", self.cash_position)
+        except Exception as e:
+            print("Exception at position_sizing error: ", str(e)) 
         print(self.get_datetime())
         if self.USE_TRADE_INDICATOR == self.TRADE_INDICATOR_NEWS_ONLY or \
             self.USE_TRADE_INDICATOR == self.TRADE_INDICATOR_MOVING_AVG_AND_NEWS:
@@ -98,127 +106,100 @@ class MLTrader(Strategy):
             # Leave out trade signals by two days
             if self.USE_TRADE_INDICATOR == self.TRADE_INDICATOR_MOVING_AVG_ONLY:
                 if self.trading_iterator_count == 1 or self.trading_iterator_count == 2:
-                    trading_positions_final.values[self.trading_iterator_count-1] = 0 #neutral
+                    trading_positions_final.values[-1] = 0 #neutral
             else:
                 if self.trading_iterator_count == 1 or self.trading_iterator_count == 2:
                     if sentiment == "neutral":
-                        trading_positions_final.values[self.trading_iterator_count-1] = 0 #neutral
+                        trading_positions_final.values[-1] = 0 #neutral
                     elif sentiment == "positive":
-                        trading_positions_final.values[self.trading_iterator_count-1] = 1 #buy
+                        trading_positions_final.values[-1] = 1 #buy
                     elif sentiment == "negative":
-                        trading_positions_final.values[self.trading_iterator_count-1] = -1 #sell
-            if(trading_positions_final.values[self.trading_iterator_count-1] != 0):
-                self.ma_indication_value = self.GT_BUY if trading_positions_final.values[self.trading_iterator_count-1] > 0 else self.GT_SEL
+                        trading_positions_final.values[-1] = -1 #sell
+            if(trading_positions_final.values[-1] != 0):
+                self.ma_indication_value = self.GT_BUY if trading_positions_final.values[-1] > 0 else self.GT_SEL
             else: #undefined
                 self.ma_indication_value = self.GT_NONE
 
         if self.USE_TRADE_INDICATOR == self.TRADE_INDICATOR_MOVING_AVG_AND_NEWS:
-            if cash > last_price: 
+            if (self.cash_position-self.FLAT_DOLLAR_FEE) > self.last_price_position: 
                 if sentiment == "positive" and probability > self.ai_propability and self.ma_indication_value == self.GT_BUY: 
                     if self.last_trade == "sell": 
-                        self.sell_all() 
+                        self.sell_all()
+                        try:
+                            self.cash_position, self.last_price_position, self.quantity_position = self.position_sizing()
+                        except Exception as e:
+                            print("Exception at position_sizing error: ", str(e))                    
                     order = self.create_order(
                         self.symbol, 
-                        quantity, 
+                        self.quantity_position, 
                         "buy", 
                         type="bracket", 
-                        take_profit_price=last_price*1.5,
-                        stop_loss_price=last_price*.9
+                        take_profit_price=self.last_price_position*1.3,
+                        stop_loss_price=self.last_price_position*.95
                     )
                     self.submit_order(order) 
                     self.last_trade = "buy"
-                    self.first_trade_was_buy = True         
                 elif sentiment == "negative" and probability > self.ai_propability and self.ma_indication_value == self.GT_SEL: 
                     if self.last_trade == "buy": 
                         self.sell_all()
-                    if self.last_trade == None:
-                        print("INVALID SELL BEFORE BUY")
-                    else:
-                        order = self.create_order(
-                            self.symbol, 
-                            quantity, 
-                            "sell", 
-                            type="bracket", 
-                            take_profit_price=last_price*.5,
-                            stop_loss_price=last_price*1.1
-                        )
-                        self.submit_order(order) 
                         self.last_trade = "sell"
         elif self.USE_TRADE_INDICATOR == self.TRADE_INDICATOR_MOVING_AVG_ONLY:
-            if cash > last_price: 
+            if (self.cash_position-self.FLAT_DOLLAR_FEE)  > self.last_price_position: 
                 if self.ma_indication_value == self.GT_BUY: 
                     if self.last_trade == "sell": 
-                        self.sell_all() 
+                        self.sell_all()
+                        try:
+                            self.cash_position, self.last_price_position, self.quantity_position = self.position_sizing()
+                        except Exception as e:
+                            print("Exception at position_sizing error: ", str(e)) 
                     order = self.create_order(
                         self.symbol, 
-                        quantity, 
+                        self.quantity_position, 
                         "buy", 
                         type="bracket", 
-                        take_profit_price=last_price*1.5,
-                        stop_loss_price=last_price*.9
+                        take_profit_price=self.last_price_position*1.3,
+                        stop_loss_price=self.last_price_position*.95
                     )
                     self.submit_order(order) 
                     self.last_trade = "buy"
-                    self.first_trade_was_buy = True
                 elif self.ma_indication_value == self.GT_SEL:
                     if self.last_trade == "buy": 
                         self.sell_all()
-                    if self.last_trade == None:
-                        print("INVALID SELL BEFORE BUY")
-                    else:
-                        order = self.create_order(
-                            self.symbol, 
-                            quantity, 
-                            "sell", 
-                            type="bracket", 
-                            take_profit_price=last_price*.5,
-                            stop_loss_price=last_price*1.1
-                        )
-                        self.submit_order(order) 
                         self.last_trade = "sell"
         else: #self.TRADE_INDICATOR_NEWS_ONLY:
-            if cash > last_price: 
+            if (self.cash_position-self.FLAT_DOLLAR_FEE) > self.last_price_position: 
                 if sentiment == "positive" and probability > self.ai_propability: 
                     if self.last_trade == "sell": 
-                        self.sell_all() 
+                        self.sell_all()
+                        try:
+                            self.cash_position, self.last_price_position, self.quantity_position = self.position_sizing()
+                        except Exception as e:
+                            print("Exception at position_sizing error: ", str(e)) 
                     order = self.create_order(
                         self.symbol, 
-                        quantity, 
+                        self.quantity_position, 
                         "buy", 
                         type="bracket", 
-                        take_profit_price=last_price*1.5,
-                        stop_loss_price=last_price*.9
+                        take_profit_price=self.last_price_position*1.3,
+                        stop_loss_price=self.last_price_position*.95
                     )
                     self.submit_order(order) 
                     self.last_trade = "buy"
-                    self.first_trade_was_buy = True
                 elif sentiment == "negative" and probability > self.ai_propability:
                     if self.last_trade == "buy": 
                         self.sell_all() 
-                    if self.last_trade == None:
-                        print("INVALID SELL BEFORE BUY")
-                    else:   
-                        order = self.create_order(
-                            self.symbol, 
-                            quantity, 
-                            "sell", 
-                            type="bracket", 
-                            take_profit_price=last_price*.5,
-                            stop_loss_price=last_price*1.1
-                        )
-                        self.submit_order(order) 
                         self.last_trade = "sell"
 
 start_date = datetime(2020,12,31)
 end_date = datetime(2024,3,7) 
 broker = Alpaca(ALPACA_CREDS) 
 strategy = MLTrader(name='mlstrat', broker=broker, benchmark_asset=MLTrader.symb,
-                    parameters={"symbol":MLTrader.symb, "cash_at_risk":.7})
+                    parameters={"symbol":MLTrader.symb, "cash_at_risk":MLTrader.CASH_AT_RISK_FACTOR})
 strategy.backtest(
     YahooDataBacktesting, 
     start_date, 
     end_date, benchmark_asset=MLTrader.symb, 
-    parameters={"symbol":MLTrader.symb, "cash_at_risk":.7}, buy_trading_fees=[MLTrader.trading_fee_1], sell_trading_fees=[MLTrader.trading_fee_1],
+    parameters={"symbol":MLTrader.symb, "cash_at_risk":MLTrader.CASH_AT_RISK_FACTOR}, buy_trading_fees=[MLTrader.trading_fee_1], sell_trading_fees=[MLTrader.trading_fee_1],
 )
 # trader = Trader()
 # trader.add_strategy(strategy)
